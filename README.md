@@ -287,6 +287,11 @@ runs `lm_head` only on the positions that are read (#155). On a desktop CPU
 that takes 16% off a 100-token prefill (about 5% of a whole command) compared
 with `d809a7c`, the revision measured below.
 
+Since revision `53a0e32` it also has `decoder_gqa.int4.onnx`, which the CPU uses
+to update the KV cache in place instead of copying all of it on every step. That
+takes a 3.2s command with a 50-name prompt from 1.18s to 0.96s on 4 threads of a
+Ryzen 7 5700X, and 19.5s of audio from 5.17s to 4.02s.
+
 It is for a desktop CPU or a GPU, not a Raspberry Pi: on a Pi 5 the 0.6B model
 already needs 1.55 GB and 2.2s for a 3.2s command with 50 names (see the table
 above), and the 1.7B model took about twice the time and 1.8 times the memory on

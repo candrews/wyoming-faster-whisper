@@ -336,7 +336,7 @@ def test_num_logits_to_keep_is_detected_by_name(
 
 
 class _MergedGraph:
-    """Runs like the merged decoder: logits row i is filled with position i."""
+    """Runs like the merged decoder: at position i, greedy picks token i."""
 
     def __init__(self, keeps_logits: bool) -> None:
         self.keeps_logits = keeps_logits
@@ -344,11 +344,12 @@ class _MergedGraph:
 
     def run(self, names, feeds, run_options=None):
         self.feeds.append(feeds)
-        positions = feeds["position_ids"][0].astype(np.float32)
+        positions = feeds["position_ids"][0]
         if self.keeps_logits:
             positions = positions[-int(feeds["num_logits_to_keep"][0]) :]
-        logits = np.repeat(positions[np.newaxis, :, np.newaxis], 3, axis=-1)
         kv = np.zeros((2, 1, 1, len(feeds["position_ids"][0]), 4), dtype=np.float32)
+        logits = np.zeros((1, len(positions), 32), dtype=np.float32)
+        logits[0, np.arange(len(positions)), positions] = 1.0
         return [logits, kv, kv]
 
 
@@ -361,12 +362,11 @@ def test_run_merged_returns_only_the_requested_rows(keeps_logits) -> None:
     model._keeps_logits = keeps_logits
     empty = np.zeros((2, 1, 1, 0, 4), dtype=np.float32)
 
-    logits, _, _ = model._run_merged(
+    predicted, _, _ = model._run_merged(
         np.zeros((1, 5, 8), dtype=np.float32), np.arange(10, 15), empty, empty, 2
     )
 
-    assert logits.shape == (1, 2, 3)
-    np.testing.assert_array_equal(logits[0, :, 0], [13, 14])
+    np.testing.assert_array_equal(predicted, [13, 14])
     (feeds,) = model._merged.feeds
     if keeps_logits:
         np.testing.assert_array_equal(feeds["num_logits_to_keep"], [2])
@@ -422,6 +422,196 @@ def test_allow_patterns_cover_both_decoder_layouts() -> None:
     # The split layout must still be downloadable.
     assert {"decoder_init.int4.onnx", "decoder_step.int4.onnx"} <= patterns
     assert "decoder_weights.int4.data" in patterns
+    assert qwen3_asr_handler._GQA_DECODER in patterns
+
+
+# --- GQA decoder: KV cache in place ----------------------------------------
+
+
+class _FakeGqaBinding:
+    """Records what is bound; outputs are whatever OrtValue was bound."""
+
+    def __init__(self) -> None:
+        self.inputs: dict = {}
+        self.outputs: dict = {}
+        self.output_order: list = []
+
+    def bind_cpu_input(self, name, value):
+        self.inputs[name] = value
+
+    def bind_ortvalue_input(self, name, value):
+        self.inputs[name] = value
+
+    def bind_ortvalue_output(self, name, value):
+        self._bind(name, value)
+
+    def bind_output(self, name):
+        self._bind(name, None)
+
+    def _bind(self, name, value):
+        # Like onnxruntime: binding a name again replaces it in place.
+        if name not in self.outputs:
+            self.output_order.append(name)
+        self.outputs[name] = value
+
+    def get_outputs(self):
+        return [self.outputs[name] for name in self.output_order]
+
+
+class _FakeGqaSession(_FakeSession):
+    """The GQA decoder: 2 layers of [batch, 1 kv head, capacity, 2].
+
+    A run writes position p's KV as p + 1 into the bound buffers, after checking
+    that every position it may attend to was written by an earlier run (and
+    never by a rejected one, which only tags it -1), and predicts token p + 1
+    at position p, so greedy decoding counts upwards.
+    """
+
+    runs: list = []
+    poisoned: set = set()
+
+    def get_inputs(self):
+        kv = ["batch", 1, "capacity", 2]
+        return [SimpleNamespace(name="input_embeds")] + [
+            SimpleNamespace(
+                name=f"past_key_values.{i}.{kind}", shape=kv, type="tensor(float)"
+            )
+            for i in range(2)
+            for kind in ("key", "value")
+        ]
+
+    def io_binding(self):
+        return _FakeGqaBinding()
+
+    def run_with_iobinding(self, binding, run_options=None):
+        positions = binding.inputs["position_ids"][0]
+        total = int(binding.inputs["total_sequence_length"])
+        assert int(binding.inputs["seqlens_k"][0]) == total - 1
+        assert positions[-1] == total - 1, "positions must end at the total length"
+        past = int(positions[0])
+        keep = int(binding.inputs["num_logits_to_keep"][0])
+        self.runs.append((past, len(positions), keep))
+        for name, value in binding.outputs.items():
+            if name.startswith("present."):
+                assert (
+                    binding.inputs[name.replace("present", "past_key_values")] is value
+                )
+                buffer = value.array
+                attended = buffer[0, 0, :past, 0]
+                np.testing.assert_array_equal(attended, np.arange(1, past + 1))
+                buffer[0, 0, past:total, :] = positions[:, np.newaxis] + 1
+        assert binding.outputs["next_tokens"] is None, "next_tokens not re-bound"
+        binding.outputs["next_tokens"] = SimpleNamespace(
+            numpy=lambda: (positions[np.newaxis, -keep:] + 1).astype(np.int64)
+        )
+
+    def get_overridable_initializers(self):
+        return [SimpleNamespace(name="num_logits_to_keep")]
+
+
+class _FakeOrtValue(SimpleNamespace):
+    @staticmethod
+    def ortvalue_from_numpy(array):
+        return _FakeOrtValue(array=array)
+
+
+@pytest.fixture(name="gqa_model")
+def gqa_model_fixture(tmp_path, stub_runtime, monkeypatch):
+    monkeypatch.setattr(qwen3_asr_handler.ort, "InferenceSession", _FakeGqaSession)
+    monkeypatch.setattr(qwen3_asr_handler.ort, "OrtValue", _FakeOrtValue)
+    _FakeGqaSession.runs = []
+    path = _fake_model_dir(tmp_path, merged=True)
+    (path / qwen3_asr_handler._GQA_DECODER).write_bytes(b"")
+    model = qwen3_asr_handler.Qwen3AsrTranscriber(str(path), str(tmp_path))
+    model._embed_tokens = np.zeros((_AUDIO_PAD + 1, 2), dtype=np.float16)
+    return model
+
+
+def test_gqa_decoder_is_preferred_on_the_cpu(gqa_model) -> None:
+    assert gqa_model._gqa is not None
+    assert gqa_model._merged is None
+    assert gqa_model._kv_shape == (2, 1, 2)
+
+
+def test_gqa_decoder_is_not_used_on_cuda(tmp_path, stub_runtime, monkeypatch) -> None:
+    # onnxruntime's CUDA GroupQueryAttention takes fp16 only.
+    class CudaSession(_FakeSession):
+        def get_providers(self):
+            return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
+    monkeypatch.setattr(qwen3_asr_handler.ort, "InferenceSession", CudaSession)
+    path = _fake_model_dir(tmp_path, merged=True)
+    (path / qwen3_asr_handler._GQA_DECODER).write_bytes(b"")
+    model = qwen3_asr_handler.Qwen3AsrTranscriber(str(path), str(tmp_path))
+    assert model._gqa is None
+    assert model._merged is not None
+
+
+def test_kv_buffer_is_bound_as_both_past_and_present(gqa_model) -> None:
+    buffer = gqa_model._acquire_kv(10)
+    assert buffer.capacity == qwen3_asr_handler._KV_CAPACITY
+    assert buffer.binding.output_order[0] == "next_tokens"
+    for layer in range(2):
+        for kind, array in (("key", buffer.keys), ("value", buffer.values)):
+            value = buffer.binding.inputs[f"past_key_values.{layer}.{kind}"]
+            assert buffer.binding.outputs[f"present.{layer}.{kind}"] is value
+            assert np.shares_memory(value.array, array)
+
+
+def test_gqa_decode_appends_in_place_and_rewinds(gqa_model, monkeypatch) -> None:
+    # Greedy counts upwards from the prompt (token p + 1 at position p).
+    prompt = [1, 2, _AUDIO_PAD, 3, 4]
+    eos = len(prompt) + 2
+    monkeypatch.setattr(qwen3_asr_handler, "_EOS_IDS", frozenset({eos}))
+    # The draft is right for one token, then wrong: its run writes position 6
+    # for a rejected token, and the next step must write over it, not after it.
+    tokens = gqa_model._generate_gqa(
+        np.zeros((1, 1, 2), dtype=np.float32), prompt, 2, [len(prompt), 0]
+    )
+    assert tokens == [len(prompt), len(prompt) + 1, eos]
+    # System turn from empty, then the rest of the prompt plus the draft on top
+    # of it, then a step from the rejected position.
+    assert _FakeGqaSession.runs == [(0, 2, 1), (2, 5, 3), (6, 1, 1)]
+
+
+def test_system_turn_is_reused_without_a_copy(gqa_model, monkeypatch) -> None:
+    monkeypatch.setattr(qwen3_asr_handler, "_EOS_IDS", frozenset({6}))
+    features = np.zeros((1, 1, 2), dtype=np.float32)
+    prompt = [1, 2, _AUDIO_PAD, 3, 4]
+    gqa_model._generate_gqa(features, prompt, 2, [])
+    gqa_model._generate_gqa(features, prompt, 2, [])
+    # The pooled buffer still held the system turn: it ran once.
+    assert [run for run in _FakeGqaSession.runs if run[0] == 0] == [(0, 2, 1)]
+
+    # A second buffer (two decodes at once) gets it copied from the cache.
+    first = gqa_model._acquire_kv(10)
+    second = gqa_model._acquire_kv(10)
+    gqa_model._load_prefix(second, prompt[:2])
+    assert [run for run in _FakeGqaSession.runs if run[0] == 0] == [(0, 2, 1)]
+    np.testing.assert_array_equal(second.keys[:, 0, 0, :2, 0], [[1, 2], [1, 2]])
+    assert first is not second
+
+
+def test_a_changed_system_turn_is_recomputed(gqa_model, monkeypatch) -> None:
+    monkeypatch.setattr(qwen3_asr_handler, "_EOS_IDS", frozenset({6, 7}))
+    features = np.zeros((1, 1, 2), dtype=np.float32)
+    gqa_model._generate_gqa(features, [1, 2, _AUDIO_PAD, 3, 4], 2, [])
+    gqa_model._generate_gqa(features, [1, 2, 9, _AUDIO_PAD, 3, 4], 3, [])
+    assert [run for run in _FakeGqaSession.runs if run[0] == 0] == [
+        (0, 2, 1),
+        (0, 3, 1),
+    ]
+
+
+def test_kv_pool_keeps_two_buffers_and_grows(gqa_model) -> None:
+    buffers = [gqa_model._acquire_kv(10) for _ in range(3)]
+    for buffer in buffers:
+        gqa_model._release_kv(buffer)
+    assert len(gqa_model._kv_pool) == qwen3_asr_handler._KV_POOL_SIZE
+
+    big = gqa_model._acquire_kv(qwen3_asr_handler._KV_CAPACITY + 1)
+    assert big.capacity == qwen3_asr_handler._KV_CAPACITY + 1
+    assert big not in buffers
 
 
 # --- mel front-end ---------------------------------------------------------
@@ -454,47 +644,47 @@ _VOCAB = 16
 _FAKE_EOS = 13  # end of text in the fake decoder's 16-token vocabulary
 
 
-def _one_hot(tokens) -> np.ndarray:
-    rows = np.zeros((len(tokens), _VOCAB), dtype=np.float32)
-    for row, token in enumerate(tokens):
-        rows[row, token % _VOCAB] = 1.0
-    return rows
+def _greedy(tokens) -> np.ndarray:
+    return np.array([token % _VOCAB for token in tokens], dtype=np.int64)
 
 
 class _FakeDecoder:
     """A 'model' whose greedy output is always ``target``, with a fake KV cache.
 
-    Mirrors one prefill over the prompt plus a draft: row j of the prefill
-    logits picks target[j], whatever the draft says, and the cache gains one
-    position per token fed. Steps check the cache never holds a rejected token.
+    Mirrors one prefill over the prompt plus a draft: entry j of the prefill's
+    greedy tokens is target[j], whatever the draft says, and the cache gains one
+    position per token fed. Steps check that no rejected token is among the
+    positions they are told to attend to.
     """
 
     def __init__(self, target, n_prompt: int = 4) -> None:
         self.target = list(target)
         self.n_prompt = n_prompt
         self.steps = 0
+        self.cache = np.zeros((1, 1, 1, 0, 1), dtype=np.float32)
 
     def prefill(self, draft):
-        logits = _one_hot(self.target[: len(draft) + 1])
-        if len(logits) < len(draft) + 1:  # target ended inside the draft
-            logits = np.concatenate(
-                [logits, _one_hot([0] * (len(draft) + 1 - len(logits)))]
-            )
+        predicted = self.target[: len(draft) + 1]
+        # The target may end inside the draft.
+        predicted = _greedy(predicted + [0] * (len(draft) + 1 - len(predicted)))
         fed = self.n_prompt + len(draft)
         cache = np.zeros((1, 1, 1, fed, 1), dtype=np.float32)
         # Tag each draft position: 1 if it matches the target there, else 2.
         for j, token in enumerate(draft):
             ok = j < len(self.target) and token == self.target[j]
             cache[0, 0, 0, self.n_prompt + j, 0] = 1.0 if ok else 2.0
-        return logits, cache
+        self.cache = cache
+        return predicted
 
     def _target(self, index):
         return self.target[index] if index < len(self.target) else 0
 
-    def step(self, tokens, position, keys, values):
+    def step(self, tokens, position):
         self.steps += 1
-        assert keys.shape[3] == position, "cache length must match the position"
-        assert (keys != 2.0).all(), "a rejected draft token is still in the cache"
+        assert self.cache.shape[3] >= position, "position is past the cache"
+        # Like the real steps, attend to the first ``position`` entries only.
+        keys = self.cache[:, :, :, :position]
+        assert (keys != 2.0).all(), "a rejected draft token is still attended to"
         index = position - self.n_prompt
         assert tokens[0] == self.target[index], "fed a token greedy would not pick"
 
@@ -505,20 +695,17 @@ class _FakeDecoder:
             for j, token in enumerate(tokens[1:], start=1)
         ]
         new = np.array(tags, np.float32).reshape(1, 1, 1, -1, 1)
-        keys = np.concatenate([keys, new], axis=3)
+        self.cache = np.concatenate([keys, new], axis=3)
         rows = [self._target(index + j + 1) for j in range(len(tokens))]
-        return _one_hot(rows)[np.newaxis], keys, keys
+        return _greedy(rows)
 
 
 def _decode(target, draft, multi_token_steps=True):
     decoder = _FakeDecoder(target)
-    logits, cache = decoder.prefill(draft)
     tokens = qwen3_asr_handler._continue_greedy(
-        logits,
+        decoder.prefill(draft),
         draft,
         decoder.n_prompt,
-        cache,
-        cache,
         decoder.step,
         multi_token_steps=multi_token_steps,
     )
@@ -590,10 +777,10 @@ def test_an_accepted_draft_skips_its_decoder_steps(small_eos) -> None:
 
 
 def test_accept_draft_stops_at_the_first_mismatch() -> None:
-    logits = _one_hot([3, 5, 7, 9])
-    assert qwen3_asr_handler._accept_draft(logits, [3, 5, 6]) == [3, 5, 7]
-    assert qwen3_asr_handler._accept_draft(logits, [3, 5, 7]) == [3, 5, 7, 9]
-    assert qwen3_asr_handler._accept_draft(logits[:1], []) == [3]
+    predicted = _greedy([3, 5, 7, 9])
+    assert qwen3_asr_handler._accept_draft(predicted, [3, 5, 6]) == [3, 5, 7]
+    assert qwen3_asr_handler._accept_draft(predicted, [3, 5, 7]) == [3, 5, 7, 9]
+    assert qwen3_asr_handler._accept_draft(predicted[:1], []) == [3]
 
 
 class _PrefillRecorder:
@@ -609,6 +796,7 @@ class _PrefillRecorder:
                 np.zeros((1, 2, 4), dtype=np.float32)
             ]
         )
+        self._gqa = None
         self._merged = object()
 
     def _context_ids(self, initial_prompt, language):

@@ -10,7 +10,7 @@ template's system turn to bias decoding toward specific spellings, so
 ``--initial-prompt`` can carry Home Assistant entity names ("Vocabulary: Ecobee,
 office lamp.") and fix names that would otherwise be transcribed phonetically.
 
-Two decoder layouts are supported, chosen by which files the model directory has:
+Three decoder layouts are supported, chosen by which files the model directory has:
 
 *merged* (``decoder_merged.int4.onnx``) - one graph taking a KV cache *and* a
 dynamic sequence length. Because the biasing prompt sits in the system turn,
@@ -19,6 +19,11 @@ once and reused for every later utterance. That matters because the prompt is no
 free: a 50-name list is ~180 tokens of prefill, which on a Pi 5 took a 3.2 s
 command from 1.47 s to 3.42 s. Reusing it gives 2.20 s, and the graph also drops
 the in-graph embedding table (1407 -> 785 MB on disk, 2.25 -> 1.55 GB peak RSS).
+
+*merged + GQA* (``decoder_gqa.int4.onnx`` next to the merged files) - the same
+graph and weights, with each layer's attention replaced by onnxruntime's fused
+GroupQueryAttention, so the KV cache stays in one buffer per layer that each
+pass appends to in place. Preferred on the CPU when present.
 
 *split* (``decoder_init`` + ``decoder_step``) - the original export. ``decoder_init``
 has no KV input and ``decoder_step`` is pinned to one token, so the prompt must be
@@ -36,7 +41,7 @@ import logging
 import threading
 import wave
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import onnxruntime as ort
@@ -88,9 +93,10 @@ _ALLOW_PATTERNS = [
     "embed_tokens.bin",
     "encoder.int4.onnx",
     "encoder.int4.onnx.data",
-    # Merged layout.
+    # Merged layout, and its GroupQueryAttention graph (same weights file).
     "decoder_merged.int4.onnx",
     "decoder_merged.int4.onnx.data",
+    "decoder_gqa.int4.onnx",
     # Split layout. A repo has one layout or the other, and patterns that match
     # nothing are simply skipped, so one list serves both.
     "decoder_init.int4.onnx",
@@ -101,12 +107,35 @@ _ALLOW_PATTERNS = [
 # Presence of this file selects the merged layout.
 _MERGED_DECODER = "decoder_merged.int4.onnx"
 
+# The merged decoder with each layer's attention replaced by onnxruntime's
+# GroupQueryAttention, reading decoder_merged's weights file. Its KV cache is one
+# buffer per layer that the graph appends to in place, instead of a stacked
+# cache passed in and returned whole on every step: that copy grew with the
+# context, and cutting rejected draft tokens off it was one more. GQA also masks
+# causally itself, so there is no attention mask to build. Used on the CPU only:
+# onnxruntime's CUDA kernel for it takes fp16 alone, so that provider keeps the
+# stacked graph.
+_GQA_DECODER = "decoder_gqa.int4.onnx"
+
+# GQA KV buffers hold at least this many positions (grown for longer prompts).
+# np.zeros leaves untouched pages unallocated, so only positions actually used
+# cost memory.
+_KV_CAPACITY = 1024
+# Idle GQA KV buffers kept for reuse. Two decodes can overlap: a streaming pass
+# that is being aborted may still be running when the next one starts.
+_KV_POOL_SIZE = 2
+
 # Optional input of the merged decoder and of decoder_init (same name and
 # meaning as in transformers): compute logits only for the last this-many
 # positions. A prefill of ~100 positions reads one or a few rows, and the
 # 151936-wide lm_head over the rest was 16-21% of prefill time on the CPU, plus
 # ~60 MB copied to the host on Vulkan.
 _NUM_LOGITS_TO_KEEP = "num_logits_to_keep"
+
+# Output of the GQA decoder: ArgMax of logits over the vocabulary, int64
+# [batch, num_logits]. Decoding is always greedy, so token ids are all that is
+# needed, and they are what the binding returns instead of 151936-wide rows.
+_NEXT_TOKENS = "next_tokens"
 
 # Streaming (--qwen3-asr-streaming): decode all audio so far again every this
 # many seconds of new audio, checking the previous pass's transcript as a draft.
@@ -191,16 +220,16 @@ def _system_ids(context_ids: Sequence[int]) -> List[int]:
     return [_IM_START, _SYSTEM, _NEWLINE, *context_ids, _IM_END, _NEWLINE]
 
 
-def _accept_draft(logits: np.ndarray, draft: Sequence[int]) -> List[int]:
+def _accept_draft(predicted: np.ndarray, draft: Sequence[int]) -> List[int]:
     """Greedy tokens implied by one prefill over a draft, as far as it holds.
 
-    ``logits`` has a row for the last prompt position and one per draft token:
-    row j is what greedy decoding would pick in place of ``draft[j]``. Draft
-    tokens are accepted while they match that pick; the returned list ends with
-    the model's own token at the first mismatch (or after the whole draft), which
-    has not been fed through the model yet. A matched end-of-text stops it early.
+    ``predicted`` has the greedy token for the last prompt position and one per
+    draft token: entry j is what greedy decoding would pick in place of
+    ``draft[j]``. Draft tokens are accepted while they match that pick; the
+    returned list ends with the model's own token at the first mismatch (or after
+    the whole draft), which has not been fed through the model yet. A matched
+    end-of-text stops it early.
     """
-    predicted = np.argmax(logits, axis=-1)
     tokens: List[int] = []
     for j, guess in enumerate(draft):
         token = int(predicted[j])
@@ -235,35 +264,31 @@ def _draft_continuation(
 
 
 def _continue_greedy(
-    logits: np.ndarray,
+    predicted: np.ndarray,
     draft: Sequence[int],
     n_prompt: int,
-    past_keys: np.ndarray,
-    past_values: np.ndarray,
-    step,
+    step: Callable[[List[int], int], np.ndarray],
     multi_token_steps: bool,
 ) -> List[int]:
     """Finish a greedy decode from a prefill that also ran ``draft``.
 
-    ``logits`` holds the prefill's rows from the last prompt position on, and the
-    KV cache covers the prompt and the whole draft. The cache is cut back to the
-    accepted draft tokens before decoding continues, so rejected ones are never
-    attended to. ``step(tokens, position, keys, values)`` runs the decoder over
-    ``tokens`` on top of the cache.
+    ``predicted`` holds the prefill's greedy tokens from the last prompt position
+    on, and the KV cache covers the prompt and the whole draft.
+    ``step(tokens, position)`` runs the decoder over ``tokens`` on top of the
+    first ``position`` entries of the cache and returns the greedy token after
+    each. Any entries past ``position`` are rejected draft tokens: the step must
+    not attend to them (the stacked layouts cut them off, the GQA one writes over
+    them).
 
     With ``multi_token_steps`` (the merged decoder; the split one's step graph
     takes a single token), each step after a mismatch also checks where the
     draft resumes, so one differing word does not cost the rest of the draft.
     """
-    tokens = _accept_draft(logits, draft)
+    tokens = _accept_draft(predicted, draft)
     accepted = len(tokens) - 1
     total_accepted = accepted
 
     position = n_prompt + accepted
-    if accepted < len(draft):
-        past_keys = np.ascontiguousarray(past_keys[:, :, :, :position])
-        past_values = np.ascontiguousarray(past_values[:, :, :, :position])
-
     cursor = accepted
     while (tokens[-1] not in _EOS_IDS) and (len(tokens) < _MAX_NEW_TOKENS):
         guess: List[int] = []
@@ -271,10 +296,7 @@ def _continue_greedy(
         if multi_token_steps and draft:
             guess, start = _draft_continuation(draft, tokens, cursor)
 
-        step_logits, past_keys, past_values = step(
-            [tokens[-1]] + guess, position, past_keys, past_values
-        )
-        new = _accept_draft(step_logits[0], guess)
+        new = _accept_draft(step([tokens[-1]] + guess, position), guess)
         accepted = len(new) - 1
         total_accepted += accepted
         tokens.extend(new)
@@ -283,14 +305,23 @@ def _continue_greedy(
         if guess:
             cursor = start + accepted
         position += 1 + accepted
-        if accepted < len(guess):
-            past_keys = np.ascontiguousarray(past_keys[:, :, :, :position])
-            past_values = np.ascontiguousarray(past_values[:, :, :, :position])
 
     if draft:
         _LOGGER.debug("Draft: %s of %s token(s) accepted", total_accepted, len(draft))
 
     return tokens[:_MAX_NEW_TOKENS]
+
+
+def _truncated_kv(
+    keys: np.ndarray, values: np.ndarray, length: int
+) -> Tuple[np.ndarray, np.ndarray]:
+    """A stacked KV cache cut back to its first ``length`` positions."""
+    if keys.shape[3] == length:
+        return keys, values
+    return (
+        np.ascontiguousarray(keys[:, :, :, :length]),
+        np.ascontiguousarray(values[:, :, :, :length]),
+    )
 
 
 def _takes_num_logits_to_keep(session: ort.InferenceSession) -> bool:
@@ -304,6 +335,45 @@ def _takes_num_logits_to_keep(session: ort.InferenceSession) -> bool:
         arg.name
         for arg in session.get_inputs() + session.get_overridable_initializers()
     }
+
+
+class _KvBuffer:
+    """One decode's KV cache for the GQA decoder, bound in place.
+
+    Each layer's key and value buffer is bound as both its past input and its
+    present output, so a pass reads the cache where it is and writes only the
+    new positions into it. Positions past the length a pass is told about are
+    never read, which is all it takes to drop rejected draft tokens.
+    """
+
+    def __init__(
+        self,
+        session: ort.InferenceSession,
+        shape: Tuple[int, int, int],
+        capacity: int,
+    ) -> None:
+        layers, kv_heads, head_dim = shape
+        self.keys = np.zeros(
+            (layers, 1, kv_heads, capacity, head_dim), dtype=np.float32
+        )
+        self.values = np.zeros_like(self.keys)
+        self.binding = session.io_binding()
+        # Bound first, so it is get_outputs()[0] (re-binding keeps its place).
+        self.binding.bind_output(_NEXT_TOKENS)
+        for layer in range(layers):
+            for kind, buffer in (("key", self.keys), ("value", self.values)):
+                value = ort.OrtValue.ortvalue_from_numpy(buffer[layer])
+                self.binding.bind_ortvalue_input(
+                    f"past_key_values.{layer}.{kind}", value
+                )
+                self.binding.bind_ortvalue_output(f"present.{layer}.{kind}", value)
+
+        # The system turn whose KV the first positions hold, if any.
+        self.prefix: Optional[Tuple[int, ...]] = None
+
+    @property
+    def capacity(self) -> int:
+        return self.keys.shape[3]
 
 
 def _causal_mask(q_len: int, past_len: int) -> np.ndarray:
@@ -365,12 +435,30 @@ class Qwen3AsrTranscriber(Transcriber):
         # provider list: a CUDA provider that fails to load is still advertised.
         warn_if_no_onnx_gpu(device, self._encoder.get_providers())
 
+        self._gqa: Optional[ort.InferenceSession] = None
         self._merged: Optional[ort.InferenceSession] = None
         self._keeps_logits = False
         self._decoder_init: Optional[ort.InferenceSession] = None
         self._decoder_step: Optional[ort.InferenceSession] = None
 
-        if (model_dir / _MERGED_DECODER).is_file():
+        # Idle GQA KV buffers, and the (layers, kv_heads, head_dim) to make new
+        # ones with.
+        self._kv_lock = threading.Lock()
+        self._kv_pool: List[_KvBuffer] = []
+        self._kv_shape: Tuple[int, int, int] = (0, 0, 0)
+
+        if (model_dir / _GQA_DECODER).is_file() and (
+            self._encoder.get_providers() == ["CPUExecutionProvider"]
+        ):
+            self._gqa = ort.InferenceSession(
+                str(model_dir / _GQA_DECODER), **session_args
+            )
+            self._keeps_logits = _takes_num_logits_to_keep(self._gqa)
+            past = [arg for arg in self._gqa.get_inputs() if arg.name.endswith(".key")]
+            # past_key_values.{i}.key is [batch, kv_heads, capacity, head_dim].
+            self._kv_shape = (len(past), past[0].shape[1], past[0].shape[3])
+            _LOGGER.debug("Using GQA decoder (KV cache updated in place)")
+        elif (model_dir / _MERGED_DECODER).is_file():
             self._merged = ort.InferenceSession(
                 str(model_dir / _MERGED_DECODER), **session_args
             )
@@ -488,9 +576,10 @@ class Qwen3AsrTranscriber(Transcriber):
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """One pass of the merged decoder over ``input_embeds``.
 
-        Returns logits for the last ``num_logits`` positions only. With an export
-        that takes num_logits_to_keep, the others are never computed; with an
-        older one they are computed and dropped here.
+        Returns the greedy token for each of the last ``num_logits`` positions
+        only, and the new KV cache. With an export that takes num_logits_to_keep,
+        the logits of the other positions are never computed; with an older one
+        they are computed and dropped here.
         """
         assert self._merged is not None
         assert num_logits >= 1  # 0 would mean "every position" to the graph
@@ -507,7 +596,7 @@ class Qwen3AsrTranscriber(Transcriber):
         logits, keys, values = self._merged.run(
             ["logits", "present_keys", "present_values"], feeds, run_options
         )
-        return logits[:, -num_logits:], keys, values
+        return np.argmax(logits[0, -num_logits:], axis=-1), keys, values
 
     def _prefix_cache(
         self, system_ids: List[int], run_options: Optional[ort.RunOptions] = None
@@ -522,7 +611,7 @@ class Qwen3AsrTranscriber(Transcriber):
         # serialize concurrent requests behind it. Two callers racing here just
         # compute the same thing twice and store the same result.
         _, keys, values = self._run_merged(
-            self._embed_tokens[system_ids].astype(np.float32)[np.newaxis, :, :],
+            self._embed(system_ids),
             np.arange(len(system_ids)),
             self._empty_kv,
             self._empty_kv,
@@ -548,18 +637,8 @@ class Qwen3AsrTranscriber(Transcriber):
         """Greedy decode reusing the system turn's KV across utterances."""
         past_keys, past_values = self._prefix_cache(prompt_ids[:n_system], run_options)
 
-        # Everything after the system turn: the audio placeholders, the
-        # assistant preamble, and the draft. Audio features replace the
-        # placeholder embeddings.
-        rest = prompt_ids[n_system:] + list(draft)
-        input_embeds = self._embed_tokens[rest].astype(np.float32)[np.newaxis, :, :]
-        audio_at = prompt_ids.index(_AUDIO_PAD) - n_system
-        input_embeds[0, audio_at : audio_at + audio_features.shape[1]] = audio_features[
-            0
-        ]
-
-        logits, past_keys, past_values = self._run_merged(
-            input_embeds,
+        predicted, past_keys, past_values = self._run_merged(
+            self._embed_after_system(audio_features, prompt_ids, n_system, draft),
             np.arange(n_system, len(prompt_ids) + len(draft)),
             past_keys,
             past_values,
@@ -567,27 +646,153 @@ class Qwen3AsrTranscriber(Transcriber):
             run_options,
         )
 
-        def step(
-            tokens: List[int], position: int, keys: np.ndarray, values: np.ndarray
-        ):
-            return self._run_merged(
-                self._embed_tokens[tokens].astype(np.float32)[np.newaxis, :, :],
+        cache = [past_keys, past_values]
+
+        def step(tokens: List[int], position: int) -> np.ndarray:
+            step_predicted, cache[0], cache[1] = self._run_merged(
+                self._embed(tokens),
                 np.arange(position, position + len(tokens)),
-                keys,
-                values,
+                *_truncated_kv(cache[0], cache[1], position),
                 len(tokens),
                 run_options,
             )
+            return step_predicted
 
         return _continue_greedy(
-            logits[0],
-            draft,
-            len(prompt_ids),
-            past_keys,
-            past_values,
-            step,
-            multi_token_steps=True,
+            predicted, draft, len(prompt_ids), step, multi_token_steps=True
         )
+
+    def _acquire_kv(self, needed: int) -> _KvBuffer:
+        """A GQA KV buffer with room for ``needed`` positions."""
+        with self._kv_lock:
+            buffer = self._kv_pool.pop() if self._kv_pool else None
+
+        if (buffer is None) or (buffer.capacity < needed):
+            assert self._gqa is not None
+            capacity = max(_KV_CAPACITY, needed)
+            buffer = _KvBuffer(self._gqa, self._kv_shape, capacity)
+
+        return buffer
+
+    def _release_kv(self, buffer: _KvBuffer) -> None:
+        with self._kv_lock:
+            if len(self._kv_pool) < _KV_POOL_SIZE:
+                self._kv_pool.append(buffer)
+
+    def _run_gqa(
+        self,
+        buffer: _KvBuffer,
+        input_embeds: np.ndarray,
+        past_len: int,
+        num_logits: int,
+        run_options: Optional[ort.RunOptions] = None,
+    ) -> np.ndarray:
+        """One pass of the GQA decoder over ``input_embeds``, appended to
+        ``buffer`` at ``past_len``; the greedy token for each of the last
+        ``num_logits`` positions."""
+        assert self._gqa is not None
+        assert num_logits >= 1  # 0 would mean "every position" to the graph
+        total = past_len + input_embeds.shape[1]
+        assert total <= buffer.capacity
+        # Keep every fed array referenced until the run is over: the binding
+        # can point at their memory rather than copy them.
+        feeds = {
+            "input_embeds": input_embeds,
+            "position_ids": np.arange(past_len, total, dtype=np.int64)[np.newaxis],
+            "seqlens_k": np.array([total - 1], dtype=np.int32),
+            "total_sequence_length": np.array(total, dtype=np.int32),
+        }
+        if self._keeps_logits:
+            feeds[_NUM_LOGITS_TO_KEEP] = np.array([num_logits], dtype=np.int64)
+        for name, value in feeds.items():
+            buffer.binding.bind_cpu_input(name, value)
+        # Re-bound every run: a bound output keeps the shape of the first run
+        # that filled it, and the number of rows changes from pass to pass.
+        buffer.binding.bind_output(_NEXT_TOKENS)
+
+        self._gqa.run_with_iobinding(buffer.binding, run_options)
+        return buffer.binding.get_outputs()[0].numpy()[0, -num_logits:]
+
+    def _load_prefix(
+        self,
+        buffer: _KvBuffer,
+        system_ids: List[int],
+        run_options: Optional[ort.RunOptions] = None,
+    ) -> None:
+        """Put the system turn's KV in the first positions of ``buffer``.
+
+        Nothing to do when the buffer already holds it, which is the usual case:
+        decodes never write there, and the prompt seldom changes.
+        """
+        key = tuple(system_ids)
+        if buffer.prefix == key:
+            return
+
+        n_system = len(system_ids)
+        buffer.prefix = None
+        with self._prefix_lock:
+            cached = self._prefix_kv if self._prefix_key == key else None
+
+        if cached is not None:
+            buffer.keys[:, :, :, :n_system] = cached[0]
+            buffer.values[:, :, :, :n_system] = cached[1]
+        else:
+            self._run_gqa(
+                buffer,
+                self._embed(system_ids),
+                0,
+                1,  # only the KV is wanted; the graph has no way to ask for none
+                run_options,
+            )
+            # Kept for the other pooled buffer, or a bigger one.
+            cached = (
+                buffer.keys[:, :, :, :n_system].copy(),
+                buffer.values[:, :, :, :n_system].copy(),
+            )
+            with self._prefix_lock:
+                self._prefix_key = key
+                self._prefix_kv = cached
+            _LOGGER.debug("Cached KV for a %s-token system turn", n_system)
+
+        buffer.prefix = key
+
+    def _generate_gqa(
+        self,
+        audio_features: np.ndarray,
+        prompt_ids: List[int],
+        n_system: int,
+        draft: Sequence[int],
+        run_options: Optional[ort.RunOptions] = None,
+    ) -> List[int]:
+        """Greedy decode with the GQA decoder; see _generate_merged."""
+        input_embeds = self._embed_after_system(
+            audio_features, prompt_ids, n_system, draft
+        )
+
+        # Every position a decode can reach: the prompt and draft, then at most
+        # _MAX_NEW_TOKENS confirmed tokens plus one step's guess on top.
+        needed = len(prompt_ids) + len(draft) + _MAX_NEW_TOKENS + _MAX_GUESS_TOKENS
+        buffer = self._acquire_kv(needed)
+        try:
+            self._load_prefix(buffer, prompt_ids[:n_system], run_options)
+            predicted = self._run_gqa(
+                buffer, input_embeds, n_system, len(draft) + 1, run_options
+            )
+
+            def step(tokens: List[int], position: int) -> np.ndarray:
+                return self._run_gqa(
+                    buffer,
+                    self._embed(tokens),
+                    position,
+                    len(tokens),
+                    run_options,
+                )
+
+            return _continue_greedy(
+                predicted, draft, len(prompt_ids), step, multi_token_steps=True
+            )
+        finally:
+            self._release_kv(buffer)
 
     def _generate(
         self,
@@ -616,29 +821,27 @@ class Qwen3AsrTranscriber(Transcriber):
             ["logits", "present_keys", "present_values"], feeds, run_options
         )
 
-        def step(
-            tokens: List[int], position: int, keys: np.ndarray, values: np.ndarray
-        ):
+        cache = [past_keys, past_values]
+
+        def step(tokens: List[int], position: int) -> np.ndarray:
             (token,) = tokens  # decoder_step is pinned to one token
-            return decoder_step.run(
+            keys, values = _truncated_kv(cache[0], cache[1], position)
+            step_logits, cache[0], cache[1] = decoder_step.run(
                 ["logits", "present_keys", "present_values"],
                 {
-                    "input_embeds": self._embed_tokens[token].astype(np.float32)[
-                        np.newaxis, np.newaxis, :
-                    ],
+                    "input_embeds": self._embed([token]),
                     "position_ids": np.array([[position]], dtype=np.int64),
                     "past_keys": keys,
                     "past_values": values,
                 },
                 run_options,
             )
+            return np.argmax(step_logits[0], axis=-1)
 
         return _continue_greedy(
-            logits[0, -num_logits:],
+            np.argmax(logits[0, -num_logits:], axis=-1),
             draft,
             len(prompt_ids),
-            past_keys,
-            past_values,
             step,
             multi_token_steps=False,
         )
@@ -679,8 +882,11 @@ class Qwen3AsrTranscriber(Transcriber):
         )
         draft = list(draft)[:_MAX_NEW_TOKENS]
 
-        if self._merged is not None:
-            return self._generate_merged(
+        if (self._gqa is not None) or (self._merged is not None):
+            generate = (
+                self._generate_gqa if self._gqa is not None else self._generate_merged
+            )
+            return generate(
                 audio_features,
                 prompt_ids,
                 len(_system_ids(context_ids)),
@@ -705,6 +911,27 @@ class Qwen3AsrTranscriber(Transcriber):
             tokens = tokens[tokens.index(_ASR_TEXT) + 1 :]
 
         return self._tokenizer.decode(tokens, skip_special_tokens=True).strip()
+
+    def _embed(self, token_ids: Sequence[int]) -> np.ndarray:
+        """[1, len(token_ids), hidden] float32 input embeddings."""
+        return self._embed_tokens[list(token_ids)].astype(np.float32)[np.newaxis]
+
+    def _embed_after_system(
+        self,
+        audio_features: np.ndarray,
+        prompt_ids: List[int],
+        n_system: int,
+        draft: Sequence[int],
+    ) -> np.ndarray:
+        """Embeddings of everything after the system turn: the audio
+        placeholders (replaced by the audio features), the assistant preamble,
+        and the draft."""
+        input_embeds = self._embed(prompt_ids[n_system:] + list(draft))
+        audio_at = prompt_ids.index(_AUDIO_PAD) - n_system
+        input_embeds[0, audio_at : audio_at + audio_features.shape[1]] = audio_features[
+            0
+        ]
+        return input_embeds
 
     def transcribe(
         self,

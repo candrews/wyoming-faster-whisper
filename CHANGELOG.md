@@ -8,7 +8,15 @@
   over the whole prefill and discarding all but a row or two (#155).
   `craigandrews/qwen3-asr-1.7b-onnx-int4-merged` has it: a 100-token prefill
   takes 603 ms instead of 720 ms on 4 threads of a Ryzen 7 5700X, with
-  identical transcripts. Models without the input work as before
+  identical transcripts. Models without the input work as before.
+
+- On the CPU, qwen3-asr updates its KV cache in place instead of copying all of
+  it on every decoder step, when the model has a `decoder_gqa.int4.onnx`
+  (onnxruntime's fused `GroupQueryAttention` over `decoder_merged`'s weights).
+  `craigandrews/qwen3-asr-1.7b-onnx-int4-merged` has it since `53a0e32`: on 4
+  threads of a Ryzen 7 5700X, a 3.2 s command with a 50-name prompt takes 0.96 s
+  instead of 1.18 s, 19.5 s of audio 4.02 s instead of 5.17 s, and peak RSS
+  drops from 3.22 to 2.84 GB. CUDA still uses `decoder_merged`.
 
 - `--cpu-threads` now defaults to `0`, meaning one thread per physical CPU core
   this process may use, instead of a fixed 4. Hyperthreads are not counted, as a
