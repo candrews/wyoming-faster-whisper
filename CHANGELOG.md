@@ -18,6 +18,11 @@
   instead of 1.18 s, 19.5 s of audio 4.02 s instead of 5.17 s, and peak RSS
   drops from 3.22 to 2.84 GB. CUDA still uses `decoder_merged`.
 
+- Python 3.11 or later is required (was 3.8). The `qwen3_asr` extra requires
+  onnxruntime 1.32, which needs it, and `qwen3_asr_gpu` onnxruntime-gpu 1.26.
+  On onnxruntime 1.18 and 1.19, `decoder_gqa`'s GroupQueryAttention gives
+  wrong results when several tokens are fed on top of a KV cache.
+
 - `--cpu-threads` now defaults to `0`, meaning one thread per physical CPU core
   this process may use, instead of a fixed 4. Hyperthreads are not counted, as a
   second thread on the same core slows inference down, and CPU affinity

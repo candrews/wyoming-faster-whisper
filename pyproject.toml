@@ -3,7 +3,7 @@ name = "wyoming-faster-whisper"
 version = "3.9.1"
 description = "Wyoming Server for Faster Whisper"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.11"
 license = {text = "MIT"}
 authors = [
     {name = "Michael Hansen", email = "mike@rhasspy.org"}
@@ -14,9 +14,6 @@ classifiers = [
     "Intended Audience :: Developers",
     "Topic :: Multimedia :: Sound/Audio :: Speech",
     "License :: OSI Approved :: MIT License",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -88,7 +85,10 @@ funasr = [
     "funasr[knf]>=1.1.0,<2",
 ]
 qwen3_asr = [
-    "onnxruntime>=1.18.1",
+    # GroupQueryAttention (decoder_gqa) gives wrong results on onnxruntime 1.18
+    # and 1.19 when several tokens are fed on top of a KV cache, which every
+    # decode does. 1.32 is the version it was measured and verified on.
+    "onnxruntime>=1.32.0",
     "tokenizers>=0.20",
 ]
 # GPU counterparts of the two onnxruntime-based extras. onnxruntime and
@@ -106,8 +106,9 @@ qwen3_asr_gpu = [
     # <1.27 keeps this on the CUDA 12 line: onnxruntime-gpu 1.27.0 moved to
     # CUDA 13, which does not match the CUDA 12 runtime that CTranslate2 and the
     # sherpa-onnx CUDA build need. The bound applies to onnx_asr_gpu too, since
-    # both extras resolve together.
-    "onnxruntime-gpu>=1.19,<1.27",
+    # both extras resolve together. 1.26 is the newest release on that line;
+    # with --device cpu, decoder_gqa runs on its CPU provider (see qwen3_asr).
+    "onnxruntime-gpu>=1.26,<1.27",
     "tokenizers>=0.20",
 ]
 hass = [

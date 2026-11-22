@@ -32,7 +32,7 @@ FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04
 # onnxruntime-gpu on PyPI switched from CUDA 12 to CUDA 13 in 1.27.0 (1.26.0 is
 # the last CUDA 12 build). Unpinned, it installs a wheel that wants
 # libcublasLt.so.13 and quietly drops back to the CPU provider on this base.
-ARG ONNXRUNTIME_GPU_VERSION=">=1.19,<1.27"
+ARG ONNXRUNTIME_GPU_VERSION=">=1.26,<1.27"
 #
 # torch is held on the CUDA 12 line for the same reason: 2.14.1 is the last
 # release with a cu126 build (2.15.0 is published for CUDA 13.2 only).
